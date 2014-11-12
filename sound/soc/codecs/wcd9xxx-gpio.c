@@ -30,6 +30,7 @@
 #include "wcd9xxx-resmgr.h"
 #include "wcd9xxx-gpio.h"
 #include <linux/key_dm_driver.h>
+#include <linux/slab.h>
 
 #ifdef USEGPIO
 #define TABLA_HS_DET_READ_CNT 4
@@ -46,6 +47,11 @@ bool g_gpio_sw_polling_flg = false;
 #define WCD9XXX_GPIO_JACK_MASK (SND_JACK_HEADSET | SND_JACK_OC_HPHL | \
 			   SND_JACK_OC_HPHR | SND_JACK_LINEOUT | \
 			   SND_JACK_UNSUPPORTED)
+
+typedef struct {
+	struct wcd9xxx_mbhc*	mbhc_p;
+	struct work_struct		work;
+} hs_irq_t;
 
 static struct gpio_hs_det_proc_state* gpio_set_hs_det_proc_state(struct wcd9xxx_mbhc *mbhc, struct gpio_hs_det_proc_state *state);
 static void gpio_jack_detect_push_state(struct wcd9xxx_mbhc *mbhc, struct gpio_hs_det_proc_state *state);
@@ -209,20 +215,18 @@ static struct gpio_hs_det_proc_state* gpio_jack_detect_pop_state(struct wcd9xxx_
 	return head;
 }
 
-irqreturn_t gpio_jack_detect_on_gpio_irq(int irq, void *data)
+static void gpio_hs_det_irq_work(struct work_struct *work)
 {
-	struct wcd9xxx_mbhc *mbhc = data;
-
+	struct wcd9xxx_mbhc *mbhc;
 	struct gpio_hs_det_proc_state *state;
 	struct gpio_hs_det_proc_state *next;
-	unsigned long flags;
+	hs_irq_t*				hs_irq_p;
 
-    if (mbhc->mbhc_cfg->gpio_irq != irq)
-    {
-        return IRQ_NONE;
-    }
+	hs_irq_p = container_of( work, hs_irq_t, work );
+	mbhc = hs_irq_p->mbhc_p;
+	kfree( hs_irq_p );
 
-	spin_lock_irqsave(&mbhc->hs_spinlock,flags);
+	EXT_ACQUIRE_LOCK(mbhc->codec_resource_lock);
 
 	for(state = mbhc->hs_det_proc_state; state != NULL; state = next) {
 		next = state->next;
@@ -230,25 +234,46 @@ irqreturn_t gpio_jack_detect_on_gpio_irq(int irq, void *data)
 			state->on_gpio_irq(mbhc);
 	}
 
-	spin_unlock_irqrestore(&mbhc->hs_spinlock,flags);
+	EXT_RELEASE_LOCK(mbhc->codec_resource_lock);
 
-    return IRQ_HANDLED;
+	return;
 }
 
-irqreturn_t gpio_btn_detect_on_gpio_irq(int irq, void *data)
+irqreturn_t gpio_jack_detect_on_gpio_irq(int irq, void *data)
 {
-	struct wcd9xxx_mbhc *mbhc = data;
+	struct wcd9xxx_mbhc*	mbhc = data;
+	hs_irq_t*				hs_irq_p;
 
-	struct gpio_hs_det_proc_state *state;
-	struct gpio_hs_det_proc_state *next;
-	unsigned long flags;
-
-    if (mbhc->mbhc_cfg->sw_gpio_irq != irq)
+	pr_debug("%s:HS DET IRQ +++++ gpio(%d)=%d\n", __func__, mbhc->mbhc_cfg->gpio, (gpio_get_value(mbhc->mbhc_cfg->gpio)));
+    if (mbhc->mbhc_cfg->gpio_irq != irq)
     {
         return IRQ_NONE;
     }
 
-	spin_lock_irqsave(&mbhc->hs_spinlock,flags);
+	hs_irq_p = kmalloc( sizeof(hs_irq_t), GFP_ATOMIC );
+	if( !hs_irq_p ){
+        return IRQ_NONE;
+	}
+
+	hs_irq_p->mbhc_p = mbhc;
+	INIT_WORK( &hs_irq_p->work, gpio_hs_det_irq_work );
+	schedule_work( &hs_irq_p->work );
+
+    return IRQ_HANDLED;
+}
+
+static void gpio_hs_sw_irq_work(struct work_struct *work)
+{
+	struct wcd9xxx_mbhc *mbhc;
+	struct gpio_hs_det_proc_state *state;
+	struct gpio_hs_det_proc_state *next;
+	hs_irq_t*				hs_irq_p;
+
+	hs_irq_p = container_of( work, hs_irq_t, work );
+	mbhc = hs_irq_p->mbhc_p;
+	kfree( hs_irq_p );
+
+	EXT_ACQUIRE_LOCK(mbhc->codec_resource_lock);
 
 	for(state = mbhc->hs_det_proc_state; state != NULL; state = next) {
 		next = state->next;
@@ -256,7 +281,31 @@ irqreturn_t gpio_btn_detect_on_gpio_irq(int irq, void *data)
 			state->on_sw_gpio_irq(mbhc);
 	}
 
-	spin_unlock_irqrestore(&mbhc->hs_spinlock,flags);
+	EXT_RELEASE_LOCK(mbhc->codec_resource_lock);
+
+	return;
+}
+
+irqreturn_t gpio_btn_detect_on_gpio_irq(int irq, void *data)
+{
+	struct wcd9xxx_mbhc*	mbhc = data;
+	hs_irq_t*				hs_irq_p;
+
+	pr_debug("%s:HS SW IRQ ----- gpio(%d)=%d\n", __func__, mbhc->mbhc_cfg->gpio, (gpio_get_value(mbhc->mbhc_cfg->gpio)));
+
+    if (mbhc->mbhc_cfg->sw_gpio_irq != irq)
+    {
+        return IRQ_NONE;
+    }
+
+	hs_irq_p = kmalloc( sizeof(hs_irq_t), GFP_ATOMIC );
+	if( !hs_irq_p ){
+        return IRQ_NONE;
+	}
+
+	hs_irq_p->mbhc_p = mbhc;
+	INIT_WORK( &hs_irq_p->work, gpio_hs_sw_irq_work );
+	schedule_work( &hs_irq_p->work );
 
     return IRQ_HANDLED;
 }
@@ -268,17 +317,11 @@ static void gpio_jack_detect_on_timer(struct wcd9xxx_mbhc *mbhc)
 
 	EXT_ACQUIRE_LOCK(mbhc->codec_resource_lock);
 
-	disable_irq_wake(mbhc->mbhc_cfg->gpio_irq);
-	disable_irq_nosync(mbhc->mbhc_cfg->gpio_irq);
-
 	for(state = mbhc->hs_det_proc_state; state != NULL; state = next) {
 		next = state->next;
 		if(state->on_timeout != NULL)
 			state->on_timeout(mbhc);
 	}
-
-	enable_irq(mbhc->mbhc_cfg->gpio_irq);
-	enable_irq_wake(mbhc->mbhc_cfg->gpio_irq);
 
 	EXT_RELEASE_LOCK(mbhc->codec_resource_lock);
 
@@ -321,6 +364,7 @@ static void gpio_hs_det_proc_state_polling_on_timeout(struct wcd9xxx_mbhc *mbhc)
 		mbhc->polling_off_state = false;
 	}
 
+	pr_debug("%s:HS DET polling gpio(%d)=%d\n", __func__, mbhc->mbhc_cfg->gpio, (gpio_get_value(mbhc->mbhc_cfg->gpio)));
 	if(!gpio_get_value(mbhc->mbhc_cfg->gpio))
 	{
 		next_state = HS_DET_STATE_INSERT;
@@ -371,6 +415,7 @@ static void gpio_hs_det_proc_state_remove_enter(struct wcd9xxx_mbhc *mbhc)
 		return;
 	}
 
+	pr_debug("%s:HS remove / SW off gpio(%d)=%d\n", __func__, mbhc->mbhc_cfg->gpio, (gpio_get_value(mbhc->mbhc_cfg->gpio)));
 	key_dm_driver_set_port(0x12);
 	key_dm_driver_set_port(0x10);
 
@@ -404,7 +449,7 @@ static void gpio_hs_det_proc_state_insert_enter(struct wcd9xxx_mbhc *mbhc)
 	sb = wcd9xxx->slim;
 	msm_get_state_count = 0;
 
-	while(msm_get_state_count < 60)
+	while(msm_get_state_count < 10)
 	{
 		if(msm_get_state(sb->ctrl) != 0)
 		{
@@ -436,7 +481,7 @@ static void gpio_hs_det_proc_state_insert_enter(struct wcd9xxx_mbhc *mbhc)
 	snd_soc_update_bits(codec, TAIKO_A_MICB_2_INT_RBIAS, 0x80, 0x80);
 #else
 	snd_soc_update_bits(codec, WCD9XXX_A_MICB_CFILT_2_CTL,    0xe0, 0xe0);
-	snd_soc_update_bits(codec, WCD9XXX_A_MICB_2_CTL,          0xa7, 0xa6);
+	snd_soc_update_bits(codec, WCD9XXX_A_MICB_2_CTL,          0xa6, 0xa6);
 	snd_soc_update_bits(codec, WCD9XXX_A_LDO_H_MODE_1,        0xcd, 0xcd);
 
 	reg = snd_soc_read(codec, WCD9XXX_A_BIAS_CENTRAL_BG_CTL);
@@ -532,6 +577,7 @@ static void gpio_hs_btn_det_proc_state_init_on_timeout(struct wcd9xxx_mbhc *mbhc
 	{
 		if(next_value)
 		{
+			pr_debug("%s:stereo HS IN pre-fixed +++++ +++++ 3pin gpio(%d)=%d\n", __func__, mbhc->mbhc_cfg->gpio, (gpio_get_value(mbhc->mbhc_cfg->gpio)));
 			key_dm_driver_set_port(0xC0);
 			snd_soc_jack_report_no_dapm(&mbhc->headset_jack, SND_JACK_HEADPHONE, WCD9XXX_GPIO_JACK_MASK);
 #if 0
@@ -543,6 +589,7 @@ static void gpio_hs_btn_det_proc_state_init_on_timeout(struct wcd9xxx_mbhc *mbhc
 		}
 		else
 		{
+			pr_debug("%s:stereo HS IN pre-fixed +++++ +++++ 4pin gpio(%d)=%d\n", __func__, mbhc->mbhc_cfg->gpio, (gpio_get_value(mbhc->mbhc_cfg->gpio)));
 			key_dm_driver_set_port(0xC0);
 			snd_soc_jack_report_no_dapm(&mbhc->headset_jack, SND_JACK_HEADSET, WCD9XXX_GPIO_JACK_MASK);
 #if 0
@@ -589,6 +636,7 @@ static void gpio_hs_btn_det_proc_state_3pinouts_on_timeout(struct wcd9xxx_mbhc *
 	{
 		if(!next_value)
 		{
+			pr_debug("%s:stereo HS IN fixed +++++ +++++ +++++ 4pin gpio(%d)=%d\n", __func__, mbhc->mbhc_cfg->gpio, (gpio_get_value(mbhc->mbhc_cfg->gpio)));
 			key_dm_driver_set_port(0xC0);
 			snd_soc_jack_report_no_dapm(&mbhc->headset_jack, SND_JACK_HEADSET, WCD9XXX_GPIO_JACK_MASK);
 			mbhc->hs_det_state = HS_DET_STATE_INSERT_4PIN;
@@ -599,6 +647,7 @@ static void gpio_hs_btn_det_proc_state_3pinouts_on_timeout(struct wcd9xxx_mbhc *
 		}
 		else
 		{
+			pr_debug("%s:stereo HS IN fixed +++++ +++++ +++++ 3pin gpio(%d)=%d\n", __func__, mbhc->mbhc_cfg->gpio, (gpio_get_value(mbhc->mbhc_cfg->gpio)));
 			wake_unlock(&mbhc->hs_det_wlock);
 			gpio_hs_polling_off(mbhc);
 		}
@@ -767,7 +816,7 @@ static void gpio_hs_polling_off(struct wcd9xxx_mbhc *mbhc)
 	reg_value |= snd_soc_read(codec, mbhc->reg_addr.micb_4_ctl);
 #else
 	snd_soc_update_bits(codec, WCD9XXX_A_MICB_CFILT_2_CTL,    0xe0, 0x20);
-	snd_soc_update_bits(codec, WCD9XXX_A_MICB_2_CTL,          0xa7, 0x27);
+	snd_soc_update_bits(codec, WCD9XXX_A_MICB_2_CTL,          0xa6, 0x26);
 
 	reg_value |= snd_soc_read(codec, WCD9XXX_A_MICB_1_CTL);
 	reg_value |= snd_soc_read(codec, WCD9XXX_A_MICB_2_CTL);

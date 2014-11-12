@@ -626,6 +626,7 @@ static int mmc_blk_ioctl_cmd(struct block_device *bdev,
 	struct mmc_request mrq = {NULL};
 	struct scatterlist sg;
 	int err;
+	int err1;
 
 	/*
 	 * The caller must have CAP_SYS_RAWIO, and must be calling this on the
@@ -711,6 +712,11 @@ static int mmc_blk_ioctl_cmd(struct block_device *bdev,
 			goto cmd_rel_host;
 	}
 
+	if ( cmd.arg == 0x03a50101 )
+	{
+		pr_notice("%s: mmc_sanitize_start\n", mmc_hostname(card->host));
+	}
+
 	mmc_wait_for_req(card->host, &mrq);
 
 	if (cmd.error) {
@@ -724,6 +730,17 @@ static int mmc_blk_ioctl_cmd(struct block_device *bdev,
 						__func__, data.error);
 		err = data.error;
 		goto cmd_rel_host;
+	}
+
+	if ( cmd.arg == 0x03a50101 )
+	{
+		pr_notice("%s: mmc_sanitize_end_hpi_start\n", mmc_hostname(card->host));
+		msleep(50);
+		err1 = mmc_interrupt_hpi(card);
+		pr_notice("%s: mmc_sanitize_hpi_end\n", mmc_hostname(card->host));
+		if (err1){
+			pr_err("%s: mmc_interrupt_hpi() failed (%d)\n", mmc_hostname(card->host), err);
+		}
 	}
 
 	/*

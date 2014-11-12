@@ -527,6 +527,7 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 			}
 		}
 
+		card->ext_csd.bkops_en = 0;
 		pr_info("%s: BKOPS_EN bit = %d\n",
 			mmc_hostname(card->host), card->ext_csd.bkops_en);
 
@@ -1754,6 +1755,7 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 	if (!oldcard)
 		host->card = card;
 
+	memcpy(&host->cached_ios, &host->ios, sizeof(host->cached_ios));
 	return 0;
 
 free_card:
@@ -1896,10 +1898,44 @@ static int mmc_suspend(struct mmc_host *host)
 		err = mmc_card_sleep(host);
 	else if (!mmc_host_is_spi(host))
 		mmc_deselect_cards(host);
-	host->card->state &= ~(MMC_STATE_HIGHSPEED | MMC_STATE_HIGHSPEED_200);
+	//host->card->state &= ~(MMC_STATE_HIGHSPEED | MMC_STATE_HIGHSPEED_200);
 
 out:
 	mmc_release_host(host);
+	return err;
+}
+
+static int mmc_partial_init(struct mmc_host *host)
+{
+	int err = 0;
+	struct mmc_card *card = host->card;
+	u32 tuning_cmd;
+
+	pr_debug("%s: %s: bw: %d timing: %d clock: %d\n", mmc_hostname(host),
+		__func__,  host->cached_ios.bus_width,  host->cached_ios.timing,
+		host->cached_ios.clock);
+
+	mmc_set_bus_width(host, host->cached_ios.bus_width);
+	mmc_set_timing(host, host->cached_ios.timing);
+	mmc_set_clock(host, host->cached_ios.clock);
+
+	if (host->ops->execute_tuning && (mmc_card_hs200(card) ||
+					  mmc_card_hs400(card))) {
+		mmc_host_clk_hold(host);
+
+		if (mmc_card_hs200(card))
+			tuning_cmd = MMC_SEND_TUNING_BLOCK_HS200;
+		else if (mmc_card_hs400(card))
+			tuning_cmd = MMC_SEND_TUNING_BLOCK_HS400;
+
+		err = host->ops->execute_tuning(host,
+				tuning_cmd);
+
+		mmc_host_clk_release(host);
+	}
+	if (err)
+		pr_err("%s: tuning execution failed\n",
+			   mmc_hostname(host));
 	return err;
 }
 
@@ -1917,7 +1953,20 @@ static int mmc_resume(struct mmc_host *host)
 	BUG_ON(!host->card);
 
 	mmc_claim_host(host);
-	err = mmc_init_card(host, host->ocr, host->card);
+
+	if (host->caps2 & MMC_CAP2_AWAKE_SUPP) {
+		err = mmc_card_awake(host);
+		if (err) {
+			pr_err("%s: %s: failed (%d) awake using CMD5\n",
+			       mmc_hostname(host),  __func__, err);
+			err = mmc_init_card(host, host->ocr, host->card);
+		} else {
+			err = mmc_partial_init(host);
+		}
+	} else {
+		err = mmc_init_card(host, host->ocr, host->card);
+	}
+
 	mmc_release_host(host);
 
 	/*

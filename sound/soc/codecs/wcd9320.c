@@ -5847,7 +5847,6 @@ static int taiko_handle_pdata(struct taiko_priv *taiko)
 			    (pdata->micbias.bias4_cfilt_sel << 5));
 
 	snd_soc_update_bits(codec, TAIKO_A_LDO_H_MODE_1, 0x20, 0x00);
-	snd_soc_update_bits(codec, TAIKO_A_MICB_2_CTL, 0x01, 0x01);
 
 	for (i = 0; i < 6; j++, i += 2) {
 		if (flag & (0x01 << i)) {
